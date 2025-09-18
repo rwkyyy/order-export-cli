@@ -1,9 +1,5 @@
 # Simple Order Export for WooCommerce via WP CLI
 
-Version: 1.0
-
-Author: Eduard V. Doloc
-
 Compatibility: Works with both WooCommerce HPOS (High-Performance Order Storage) and legacy postmeta-based order storage.
 
 Execution: WP-CLI only
