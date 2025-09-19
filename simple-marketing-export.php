@@ -27,14 +27,13 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 
 			$args = array(
 				'status' => 'completed',
-//				'limit'  => 10000,
-                'limit' => -1,
+				'limit'  => - 1,
 				'return' => 'ids',
 			);
 
-			$order_ids = wc_get_orders( $args );
+			$all_order_ids = wc_get_orders( $args );
 
-			if ( empty( $order_ids ) ) {
+			if ( empty( $all_order_ids ) ) {
 				WP_CLI::warning( 'No completed orders found.' );
 
 				return;
@@ -45,32 +44,49 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 				mkdir( $upload_dir, 0755, true );
 			}
 
-//            $filename = $upload_dir . 'marketing-export-' . date( 'Y-m-d-H-i-s' ) . '.csv';
 			$filename = $upload_dir . 'marketing-export-' . wp_generate_password( 16, false ) . '-' . date( 'Y-m-d-H-i-s' ) . '.csv';
 			$file     = fopen( $filename, 'w' );
-
 			fputcsv( $file, [ 'phone', 'email' ] );
 
-			$progress = \WP_CLI\Utils\make_progress_bar( 'Exporting orders', count( $order_ids ) );
+			$batch_size    = 10000;
+			$total_orders  = count( $all_order_ids );
+			$total_batches = ceil( $total_orders / $batch_size );
+			WP_CLI::log( "Starting batch export 1 out of $total_batches batches.\n" );
 
-			foreach ( $order_ids as $order_id ) {
-				$order = wc_get_order( $order_id );
-				// Try to get via order object first (HPOS), fallback to postmeta if needed
-				if ( $order ) {
-					$email = $order->get_billing_email();
-					$phone = $order->get_billing_phone();
-				} else {
-					$email = get_post_meta( $order_id, '_billing_email', true );
-					$phone = get_post_meta( $order_id, '_billing_phone', true );
+			$progress = \WP_CLI\Utils\make_progress_bar( 'Exporting orders', $total_orders );
+
+			for ( $batch = 0; $batch < $total_batches; $batch ++ ) {
+				$offset          = $batch * $batch_size;
+				$batch_order_ids = array_slice( $all_order_ids, $offset, $batch_size );
+
+				foreach ( $batch_order_ids as $order_id ) {
+					$order = wc_get_order( $order_id );
+					if ( $order instanceof WC_Order_Refund ) {
+						$progress->tick();
+						continue;
+					}
+
+					if ( $order ) {
+						$email = $order->get_billing_email();
+						$phone = $order->get_billing_phone();
+					} else {
+						$email = get_post_meta( $order_id, '_billing_email', true );
+						$phone = get_post_meta( $order_id, '_billing_phone', true );
+					}
+
+					fputcsv( $file, [ $phone, $email ] );
+					$progress->tick();
+
+					//avoid memory spikes for high order no - comment for speed!
+					unset( $order );
 				}
 
-				fputcsv( $file, [ $phone, $email ] );
-				$progress->tick();
+				sleep( 1 );
+				WP_CLI::log( "Completed batch " . ( $batch + 1 ) . " of $total_batches." );
 			}
 
 			$progress->finish();
 			fclose( $file );
-
 			WP_CLI::success( "Exported to $filename" );
 		}
 	}
