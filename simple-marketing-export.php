@@ -25,21 +25,24 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 				WP_CLI::error( 'WooCommerce is not active.' );
 			}
 
-			$batch_size = 2000;
-			$page       = 1;
+			global $wpdb;
 
-			$total_orders = wc_get_orders( [
-				'status'   => 'completed',
-				'limit'    => 1,
-				'paginate' => true,
-			] );
+			$batch_size = 5000;
+			$offset     = 0;
 
-			if ( empty( $total_orders->total ) ) {
-				WP_CLI::warning( 'No completed orders found.' );
-				return;
+			// Get total count
+			$total_orders_count = $wpdb->get_var("
+			    SELECT COUNT(*)
+			    FROM {$wpdb->prefix}wc_order_addresses a
+			    INNER JOIN {$wpdb->prefix}wc_orders o ON o.id = a.order_id
+			    WHERE a.address_type = 'billing'
+			    AND o.status = 'wc-completed'
+			");
+
+			if ( empty( $total_orders_count ) ) {
+			    WP_CLI::warning( 'No completed orders found.' );
+			    return;
 			}
-
-			$total_orders_count = $total_orders->total;
 
 			$upload_dir = plugin_dir_path( __FILE__ ) . 'exports/';
 			if ( ! file_exists( $upload_dir ) ) {
@@ -48,48 +51,32 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 
 			$filename = $upload_dir . 'marketing-export-' . wp_generate_password( 16, false ) . '-' . date( 'Y-m-d-H-i-s' ) . '.csv';
 			$file     = fopen( $filename, 'w' );
-//			fputcsv( $file, [ 'phone', 'email' ] );
 			fputcsv( $file, [ 'phone' ] );
 
 			$progress = \WP_CLI\Utils\make_progress_bar( 'Exporting orders', $total_orders_count );
 
 			do {
-				$orders = wc_get_orders( [
-					'status' => 'completed',
-					'limit'  => $batch_size,
-					'page'   => $page,
-					'return' => 'ids',
-				] );
+			    $results = $wpdb->get_results( $wpdb->prepare("
+			        SELECT a.phone
+			        FROM {$wpdb->prefix}wc_order_addresses a
+			        INNER JOIN {$wpdb->prefix}wc_orders o ON o.id = a.order_id
+			        WHERE a.address_type = 'billing'
+			        AND o.status = 'wc-completed'
+			        LIMIT %d OFFSET %d
+			    ", $batch_size, $offset ) );
 
-				if ( empty( $orders ) ) {
-					break;
-				}
+			    if ( empty( $results ) ) {
+			        break;
+			    }
 
-				foreach ( $orders as $order_id ) {
-					$order = wc_get_order( $order_id );
-					if ( $order instanceof WC_Order_Refund ) {
-						$progress->tick();
-						continue;
-					}
+			    foreach ( $results as $row ) {
+			        fputcsv( $file, [ $row->phone ] );
+			        $progress->tick();
+			    }
 
-					if ( $order ) {
-//						$email = $order->get_billing_email();
-						$phone = $order->get_billing_phone();
-					} else {
-//						$email = get_post_meta( $order_id, '_billing_email', true );
-						$phone = get_post_meta( $order_id, '_billing_phone', true );
-					}
+			    WP_CLI::log( "Processed offset $offset" );
+			    $offset += $batch_size;
 
-//					fputcsv( $file, [ $phone, $email ] );
-					fputcsv( $file, [ $phone ] );
-					$progress->tick();
-
-					//avoid memory spikes for high order no - comment for speed!
-//					unset( $order );
-				}
-
-				WP_CLI::log( "Completed batch $page" );
-				$page++;
 			} while ( true );
 
 			$progress->finish();
