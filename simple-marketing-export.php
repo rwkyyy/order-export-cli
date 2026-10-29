@@ -2,7 +2,7 @@
 /*
 Plugin Name: Simple Export of Orders for Marketing Campaigns
 Description: Exports customer email and phone from WooCommerce orders via WP-CLI or a WooCommerce admin panel.
-Version: 1.2
+Version: 1.3
 Author: Eduard V. Doloc
 Author URI: https://uprise.ro
 */
@@ -24,7 +24,7 @@ class Simple_Marketing_Export {
 	 *
 	 * @param array         $args   status, date_from, date_to, all_periods
 	 * @param callable|null $logger Optional callback receiving ($event, $payload)
-	 *                              events: start(total), tick(), log(msg), finish()
+	 *                              events: start(total), tick(count), log(msg), finish()
 	 *
 	 * @return array|WP_Error
 	 */
@@ -71,17 +71,26 @@ class Simple_Marketing_Export {
 		}
 
 		$batch_size = 5000;
-		$offset     = 0;
+		$last_id    = 0;
 
+		// Keyset pagination on order id: one billing address per order (unique key),
+		// so o.id is a stable, unique cursor and each batch is an index range scan.
 		do {
-			$select_sql = "SELECT a.email, a.phone
+			$select_sql = "SELECT o.id, a.email, a.phone
 				FROM {$wpdb->prefix}wc_order_addresses a
 				INNER JOIN {$wpdb->prefix}wc_orders o ON o.id = a.order_id
-				WHERE $where_sql
-				LIMIT %d OFFSET %d";
+				WHERE $where_sql AND o.id > %d
+				ORDER BY o.id
+				LIMIT %d";
 
-			$batch_params = array_merge( $params, [ $batch_size, $offset ] );
+			$batch_params = array_merge( $params, [ $last_id, $batch_size ] );
 			$results      = $wpdb->get_results( $wpdb->prepare( $select_sql, $batch_params ) );
+
+			if ( $wpdb->last_error ) {
+				fclose( $file );
+				unlink( $filepath );
+				return new WP_Error( 'sme_db_failure', $wpdb->last_error );
+			}
 
 			if ( empty( $results ) ) {
 				break;
@@ -89,17 +98,15 @@ class Simple_Marketing_Export {
 
 			foreach ( $results as $row ) {
 				fputcsv( $file, [ $row->email, $row->phone ] );
-				if ( $logger ) {
-					$logger( 'tick' );
-				}
 			}
+
+			$last_id = (int) $results[ count( $results ) - 1 ]->id;
 
 			if ( $logger ) {
-				$logger( 'log', "Processed offset $offset" );
+				$logger( 'tick', count( $results ) );
+				$logger( 'log', "Processed up to order #$last_id" );
 			}
-
-			$offset += $batch_size;
-		} while ( true );
+		} while ( count( $results ) === $batch_size );
 
 		fclose( $file );
 
@@ -113,6 +120,114 @@ class Simple_Marketing_Export {
 			'url'      => plugins_url( 'exports/' . $filename, SME_PLUGIN_FILE ),
 			'rows'     => $total,
 		];
+	}
+
+	/**
+	 * Export unique billing phone numbers from all completed orders.
+	 *
+	 * Paginates on order id (keyset) instead of OFFSET, so every batch is an
+	 * index range scan no matter how deep into the table it is.
+	 *
+	 * @param callable|null $logger Optional callback receiving ($event, $payload)
+	 *                              events: start(total), tick(count), finish()
+	 *
+	 * @return array|WP_Error
+	 */
+	public static function run_phone_export( $logger = null ) {
+		global $wpdb;
+
+		if ( ! class_exists( 'WooCommerce' ) ) {
+			return new WP_Error( 'sme_no_woocommerce', 'WooCommerce is not active.' );
+		}
+
+		if ( ! self::ensure_exports_dir() ) {
+			return new WP_Error( 'sme_dir_failure', 'Could not create exports directory.' );
+		}
+
+		$base_sql = "FROM {$wpdb->prefix}wc_orders o
+			INNER JOIN {$wpdb->prefix}wc_order_addresses a ON a.order_id = o.id AND a.address_type = 'billing'
+			WHERE o.type = 'shop_order' AND o.status = 'wc-completed'";
+
+		$total = (int) $wpdb->get_var( "SELECT COUNT(*) $base_sql" );
+
+		if ( $total === 0 ) {
+			return new WP_Error( 'sme_no_orders', 'No completed orders found.' );
+		}
+
+		$filename = 'marketing-phones-' . wp_generate_password( 16, false ) . '-' . date( 'Y-m-d-H-i-s' ) . '.csv';
+		$filepath = SME_EXPORTS_DIR . $filename;
+		$file     = fopen( $filepath, 'w' );
+		if ( ! $file ) {
+			return new WP_Error( 'sme_file_failure', 'Could not open export file for writing.' );
+		}
+		// Normalized phones are only digits and "+", so plain lines are valid CSV.
+		fwrite( $file, "phone\n" );
+
+		if ( $logger ) {
+			$logger( 'start', $total );
+		}
+
+		$batch_size = 20000;
+		$last_id    = 0;
+		$seen       = [];
+
+		do {
+			$rows = $wpdb->get_results(
+				$wpdb->prepare( "SELECT o.id, a.phone $base_sql AND o.id > %d ORDER BY o.id LIMIT %d", $last_id, $batch_size ),
+				ARRAY_N
+			);
+
+			if ( $wpdb->last_error ) {
+				fclose( $file );
+				unlink( $filepath );
+				return new WP_Error( 'sme_db_failure', $wpdb->last_error );
+			}
+
+			if ( empty( $rows ) ) {
+				break;
+			}
+
+			$lines = '';
+			foreach ( $rows as $row ) {
+				$phone = self::normalize_phone( (string) $row[1] );
+				if ( $phone !== '' && ! isset( $seen[ $phone ] ) ) {
+					$seen[ $phone ] = true;
+					$lines         .= $phone . "\n";
+				}
+			}
+			fwrite( $file, $lines );
+
+			$last_id = (int) $rows[ count( $rows ) - 1 ][0];
+
+			if ( $logger ) {
+				$logger( 'tick', count( $rows ) );
+			}
+		} while ( count( $rows ) === $batch_size );
+
+		fclose( $file );
+
+		if ( $logger ) {
+			$logger( 'finish' );
+		}
+
+		return [
+			'filename' => $filename,
+			'filepath' => $filepath,
+			'url'      => plugins_url( 'exports/' . $filename, SME_PLUGIN_FILE ),
+			'rows'     => count( $seen ),
+			'orders'   => $total,
+		];
+	}
+
+	/**
+	 * Keep only digits and a leading "+", so "0722 123 456" and "0722-123-456" dedupe together.
+	 */
+	private static function normalize_phone( string $raw ): string {
+		$digits = preg_replace( '/\D+/', '', $raw );
+		if ( $digits === '' ) {
+			return '';
+		}
+		return ltrim( $raw )[0] === '+' ? '+' . $digits : $digits;
 	}
 
 	private static function build_where( array $args ): array {
@@ -269,6 +384,27 @@ if ( is_admin() ) {
 				} catch ( \Throwable $e ) {
 					$crash_msg = $e->getMessage();
 				}
+			} elseif ( $action === 'export_phones' ) {
+				check_admin_referer( 'sme_export_phones' );
+
+				@set_time_limit( 0 );
+				ignore_user_abort( true );
+
+				try {
+					$result = Simple_Marketing_Export::run_phone_export();
+					if ( is_wp_error( $result ) ) {
+						$error = $result->get_error_message();
+					} else {
+						$notice = sprintf(
+							'Exported %d unique phone numbers from %d completed orders to %s',
+							(int) $result['rows'],
+							(int) $result['orders'],
+							$result['filename']
+						);
+					}
+				} catch ( \Throwable $e ) {
+					$crash_msg = $e->getMessage();
+				}
 			} elseif ( $action === 'purge' ) {
 				check_admin_referer( 'sme_purge' );
 				$purged = Simple_Marketing_Export::purge_exports();
@@ -306,7 +442,7 @@ if ( is_admin() ) {
 					<div class="notice notice-error">
 						<p><strong>The export crashed:</strong> <?php echo esc_html( $crash_msg ); ?></p>
 						<p>Run it from the command line instead — it bypasses PHP web limits:</p>
-						<pre style="background:#fff;border:1px solid #ccd0d4;padding:8px;"><code>wp simple-marketing export</code></pre>
+						<pre style="background:#fff;border:1px solid #ccd0d4;padding:8px;"><code><?php echo $action === 'export_phones' ? 'wp simple-marketing phones' : 'wp simple-marketing export'; ?></code></pre>
 					</div>
 				<?php endif; ?>
 
@@ -380,6 +516,19 @@ if ( is_admin() ) {
 					</table>
 					<p>
 						<button type="submit" class="button button-primary">Run export</button>
+					</p>
+				</form>
+
+				<h2 style="margin-top:1.5em;">Phones only</h2>
+				<p>
+					Unique billing phone numbers from all completed orders, cleaned to digits (plus a leading <code>+</code>).
+					WP-CLI: <code>wp simple-marketing phones</code>
+				</p>
+				<form method="post">
+					<?php wp_nonce_field( 'sme_export_phones' ); ?>
+					<input type="hidden" name="sme_action" value="export_phones" />
+					<p>
+						<button type="submit" class="button button-primary">Export phones</button>
 					</p>
 				</form>
 
@@ -467,26 +616,49 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 				'all_periods' => isset( $assoc_args['all'] ),
 			];
 
-			$progress = null;
-			$logger   = function ( $event, $payload = null ) use ( &$progress ) {
-				if ( $event === 'start' ) {
-					$progress = \WP_CLI\Utils\make_progress_bar( 'Exporting orders', (int) $payload );
-				} elseif ( $event === 'tick' && $progress ) {
-					$progress->tick();
-				} elseif ( $event === 'log' ) {
-					WP_CLI::log( (string) $payload );
-				} elseif ( $event === 'finish' && $progress ) {
-					$progress->finish();
-				}
-			};
-
-			$result = Simple_Marketing_Export::run_export( $run_args, $logger );
+			$result = Simple_Marketing_Export::run_export( $run_args, $this->progress_logger( 'Exporting orders' ) );
 
 			if ( is_wp_error( $result ) ) {
 				WP_CLI::error( $result->get_error_message() );
 			}
 
 			WP_CLI::success( "Exported {$result['rows']} rows to {$result['filepath']}" );
+		}
+
+		/**
+		 * Export unique billing phone numbers from all completed orders.
+		 *
+		 * Phones are cleaned to digits (plus a leading "+") and deduplicated.
+		 *
+		 * ## EXAMPLES
+		 *
+		 *     wp simple-marketing phones
+		 *
+		 * @when after_wp_load
+		 */
+		public function phones( $args, $assoc_args ) {
+			$result = Simple_Marketing_Export::run_phone_export( $this->progress_logger( 'Scanning completed orders' ) );
+
+			if ( is_wp_error( $result ) ) {
+				WP_CLI::error( $result->get_error_message() );
+			}
+
+			WP_CLI::success( "Exported {$result['rows']} unique phone numbers from {$result['orders']} completed orders to {$result['filepath']}" );
+		}
+
+		private function progress_logger( string $label ): callable {
+			$progress = null;
+			return function ( $event, $payload = null ) use ( $label, &$progress ) {
+				if ( $event === 'start' ) {
+					$progress = \WP_CLI\Utils\make_progress_bar( $label, (int) $payload );
+				} elseif ( $event === 'tick' && $progress ) {
+					$progress->tick( $payload ? (int) $payload : 1 );
+				} elseif ( $event === 'log' ) {
+					WP_CLI::log( (string) $payload );
+				} elseif ( $event === 'finish' && $progress ) {
+					$progress->finish();
+				}
+			};
 		}
 	}
 

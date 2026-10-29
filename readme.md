@@ -33,6 +33,10 @@ To run the export, use:
 
 ` wp simple-marketing export `
 
+For unique billing phone numbers only (completed orders, cleaned to digits plus a leading `+`):
+
+` wp simple-marketing phones `
+
 After running the command, a file like:
 
 `marketing-export-abc12345-2025-09-18-00-00-00.csv`
